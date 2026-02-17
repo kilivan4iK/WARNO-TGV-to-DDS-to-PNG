@@ -2,11 +2,9 @@
 setlocal enabledelayedexpansion
 pushd "%~dp0"
 
-REM --- вибір python (якщо є venv поруч, буде краще)
 set "PY=python"
 if exist ".venv\Scripts\python.exe" set "PY=.venv\Scripts\python.exe"
 
-REM --- перевірка, що zstandard встановлений
 %PY% -c "import zstandard" >nul 2>&1
 if errorlevel 1 (
   echo [ERROR] Python module "zstandard" not found.
@@ -15,18 +13,25 @@ if errorlevel 1 (
   exit /b 1
 )
 
-REM --- папка для результатів
-if not exist "dds_out" mkdir "dds_out"
+%PY% -c "from PIL import Image" >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] Python module "Pillow" not found.
+  echo Run: %PY% -m pip install pillow
+  pause
+  exit /b 1
+)
+
+if not exist "png_out" mkdir "png_out"
 
 echo Converting all .tgv in: %CD%
 echo.
 
 for %%F in (*.tgv) do (
-  echo [%%F] -> dds_out\%%~nF.dds
-  %PY% tgv_to_dds.py "%%F" "dds_out\%%~nF.dds"
+  echo [%%F] -^> png_out\%%~nF.png
+  %PY% tgv_to_png.py "%%F" "png_out\%%~nF.png" --split auto
 )
 
 echo.
-echo Done! DDS files are in: dds_out
+echo Done! PNG files are in: png_out
 pause
 popd
