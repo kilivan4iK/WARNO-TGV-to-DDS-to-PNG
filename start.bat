@@ -23,13 +23,15 @@ if errorlevel 1 (
 
 if not exist "png_out" mkdir "png_out"
 
+set "MIRROR_FLAG="
+set /p "MIRROR_INPUT=Mirror textures horizontally? [y/N]: "
+if /I "!MIRROR_INPUT!"=="y" set "MIRROR_FLAG=--mirror"
+if /I "!MIRROR_INPUT!"=="yes" set "MIRROR_FLAG=--mirror"
+
 echo Converting all .tgv in: %CD%
 echo.
 
-for %%F in (*.tgv) do (
-  echo [%%F] -^> png_out\%%~nF.png
-  %PY% tgv_to_png.py "%%F" "png_out\%%~nF.png" --split auto
-)
+%PY% tgv_to_png.py "." "png_out" --split auto --recursive !MIRROR_FLAG!
 
 echo.
 echo Done! PNG files are in: png_out

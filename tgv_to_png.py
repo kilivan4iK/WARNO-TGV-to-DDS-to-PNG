@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image, ImageOps
 import zstandard as zstd
 
 try:
@@ -279,6 +279,161 @@ def detect_texture_role(path: Path, fmt: str) -> str:
     return "generic"
 
 
+def extract_unit_name_from_atlas(atlas_path: Path) -> str | None:
+    try:
+        text = atlas_path.read_bytes().decode("latin1", errors="ignore")
+    except OSError:
+        return None
+
+    match = re.search(r"/([A-Za-z0-9_]+)/TSC", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def find_unit_name_in_folder(folder: Path) -> str | None:
+    for atlas_path in sorted(folder.glob("*.atlas")):
+        unit_name = extract_unit_name_from_atlas(atlas_path)
+        if unit_name:
+            return unit_name
+    return None
+
+
+def canonical_stem_for_file(in_file: Path, unit_name: str | None) -> str:
+    if not unit_name:
+        return in_file.stem
+
+    stem_low = in_file.stem.lower()
+    if "diffusetexturenoalpha" in stem_low:
+        return f"{unit_name}_D"
+    if "combinedormtexture" in stem_low:
+        return f"{unit_name}_ORM"
+    if "normaltexture" in stem_low or "tscnm" in stem_low:
+        return f"{unit_name}_NM"
+    if "combineddatexture" in stem_low or "coloralpha" in stem_low:
+        return f"{unit_name}_DA"
+    return in_file.stem
+
+
+def split_base_and_tag(stem: str) -> tuple[str, str | None]:
+    stem_up = stem.upper()
+    for tag in ("_NM", "_ORM", "_DA", "_D", "_A", "_AO", "_R", "_M"):
+        if stem_up.endswith(tag):
+            return stem[: -len(tag)], tag[1:]
+    return stem, None
+
+
+def true_ranges(mask_1d: "np.ndarray") -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    start = None
+    for idx, value in enumerate(mask_1d.tolist()):
+        if value and start is None:
+            start = idx
+        elif not value and start is not None:
+            ranges.append((start, idx))
+            start = None
+    if start is not None:
+        ranges.append((start, len(mask_1d)))
+    return ranges
+
+
+def align_bbox_to_4px(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
+    x0, y0, x1, y1 = bbox
+    x0 = max(0, (x0 // 4) * 4)
+    y0 = max(0, (y0 // 4) * 4)
+    x1 = min(width, ((x1 + 3) // 4) * 4)
+    y1 = min(height, ((y1 + 3) // 4) * 4)
+    return x0, y0, x1, y1
+
+
+def bbox_from_row_range(mask: "np.ndarray", y0: int, y1: int) -> tuple[int, int, int, int] | None:
+    if y1 <= y0:
+        return None
+
+    sub = mask[y0:y1]
+    if not sub.any():
+        return None
+
+    col_counts = sub.sum(axis=0)
+    max_col = int(col_counts.max())
+    if max_col <= 0:
+        return None
+
+    col_threshold = max(4, int(max_col * 0.40))
+    col_ranges = true_ranges(col_counts >= col_threshold)
+    if not col_ranges:
+        return None
+
+    x0, x1 = max(col_ranges, key=lambda r: r[1] - r[0])
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+def detect_normal_main_track_bboxes(image: Image.Image) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+    if np is None:
+        return None, None
+
+    arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if arr.size == 0:
+        return None, None
+
+    height, width, _ = arr.shape
+    sample = arr[::4, ::4].reshape(-1, 3)
+    colors, counts = np.unique(sample, axis=0, return_counts=True)
+    bg = colors[counts.argmax()]
+
+    diff = np.abs(arr.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
+    fg = diff > 6
+
+    row_counts = fg.sum(axis=1)
+    max_row = int(row_counts.max())
+    min_row_pixels = max(8, width // 10)
+    if max_row < min_row_pixels:
+        return None, None
+
+    high_threshold = max(min_row_pixels, int(max_row * 0.75))
+    main_ranges = true_ranges(row_counts >= high_threshold)
+    if not main_ranges:
+        return None, None
+
+    main_y0, main_y1 = max(main_ranges, key=lambda r: r[1] - r[0])
+    main_box = bbox_from_row_range(fg, main_y0, main_y1)
+    if main_box is None:
+        return None, None
+    main_box = align_bbox_to_4px(main_box, width, height)
+
+    track_box = None
+    if main_y1 < height:
+        track_rows = np.zeros(height, dtype=bool)
+        track_rows[main_y1:] = row_counts[main_y1:] >= min_row_pixels
+        track_ranges = true_ranges(track_rows)
+        if track_ranges:
+            ty0, ty1 = max(track_ranges, key=lambda r: r[1] - r[0])
+            candidate = bbox_from_row_range(fg, ty0, ty1)
+            if candidate is not None:
+                candidate = align_bbox_to_4px(candidate, width, height)
+                area = (candidate[2] - candidate[0]) * (candidate[3] - candidate[1])
+                if area >= (width * height) // 200:
+                    track_box = candidate
+
+    return main_box, track_box
+
+
+def track_output_path(out_main: Path, role: str) -> Path:
+    role_low = role.lower()
+    base, tag = split_base_and_tag(out_main.stem)
+    if role_low == "normal" and tag == "NM":
+        return out_main.with_name(f"{base}_TRK_NM.png")
+    if role_low == "orm" and tag == "ORM":
+        return out_main.with_name(f"{base}_TRK_ORM.png")
+    return out_main.with_name(f"{out_main.stem}_track_{role_low}.png")
+
+
+def maybe_mirror(image: Image.Image, mirror: bool) -> Image.Image:
+    if mirror:
+        return ImageOps.mirror(image)
+    return image
+
+
 def normal_reconstruct_z(rgb: Image.Image) -> tuple[Image.Image, Image.Image]:
     if np is None:
         raise RuntimeError("NumPy is not installed, cannot reconstruct BC5 normal Z channel")
@@ -309,11 +464,21 @@ def preview_8bit_from_16bit(image: Image.Image) -> Image.Image:
 def save_auto_channels(image: Image.Image, role: str, out_main: Path) -> list[Path]:
     out_paths: list[Path] = []
     stem = out_main.with_suffix("")
+    base_name, canonical_tag = split_base_and_tag(stem.name)
 
     if role == "orm":
         rgb = image.convert("RGB")
-        for channel, suffix in zip(rgb.split(), ("occlusion", "roughness", "metallic")):
-            path = stem.with_name(f"{stem.name}_{suffix}.png")
+        if canonical_tag == "ORM":
+            names = (f"{base_name}_AO.png", f"{base_name}_R.png", f"{base_name}_M.png")
+        else:
+            names = (
+                f"{stem.name}_occlusion.png",
+                f"{stem.name}_roughness.png",
+                f"{stem.name}_metallic.png",
+            )
+
+        for channel, filename in zip(rgb.split(), names):
+            path = stem.with_name(filename)
             channel.save(path)
             out_paths.append(path)
 
@@ -321,13 +486,18 @@ def save_auto_channels(image: Image.Image, role: str, out_main: Path) -> list[Pa
         rgba = image.convert("RGBA")
         r, g, b, a = rgba.split()
 
-        diffuse_path = stem.with_name(f"{stem.name}_diffuse.png")
-        alpha_path = stem.with_name(f"{stem.name}_alpha.png")
+        if canonical_tag == "DA":
+            alpha_path = stem.with_name(f"{base_name}_A.png")
+            a.save(alpha_path)
+            out_paths.append(alpha_path)
+        else:
+            diffuse_path = stem.with_name(f"{stem.name}_diffuse.png")
+            alpha_path = stem.with_name(f"{stem.name}_alpha.png")
 
-        Image.merge("RGB", (r, g, b)).save(diffuse_path)
-        a.save(alpha_path)
+            Image.merge("RGB", (r, g, b)).save(diffuse_path)
+            a.save(alpha_path)
 
-        out_paths.extend((diffuse_path, alpha_path))
+            out_paths.extend((diffuse_path, alpha_path))
 
     elif role == "splat":
         rgba = image.convert("RGBA")
@@ -347,12 +517,10 @@ def save_auto_channels(image: Image.Image, role: str, out_main: Path) -> list[Pa
         out_paths.extend((x_path, y_path))
 
         if np is not None:
-            reconstructed, z_chan = normal_reconstruct_z(rgb)
-            recon_path = stem.with_name(f"{stem.name}_normal_reconstructed.png")
+            _, z_chan = normal_reconstruct_z(rgb)
             z_path = stem.with_name(f"{stem.name}_normal_z.png")
-            reconstructed.save(recon_path)
             z_chan.save(z_path)
-            out_paths.extend((recon_path, z_path))
+            out_paths.append(z_path)
 
     elif role == "height" and image.mode in ("I;16", "I;16L", "I;16B"):
         preview = preview_8bit_from_16bit(image)
@@ -381,32 +549,68 @@ def save_all_channels(image: Image.Image, out_main: Path) -> list[Path]:
     return out_paths
 
 
-def resolve_output_file(in_file: Path, output_arg: str | None) -> Path:
+def resolve_output_file(in_file: Path, output_arg: str | None, stem_override: str | None = None) -> Path:
+    stem = stem_override or in_file.stem
     if output_arg is None:
-        return in_file.with_suffix(".png")
+        return in_file.with_name(f"{stem}.png")
 
     out = Path(output_arg)
     if out.suffix.lower() == ".png":
         return out
-    return out / f"{in_file.stem}.png"
+    return out / f"{stem}.png"
 
 
-def convert_one(in_file: Path, out_file: Path, split_mode: str) -> None:
+def convert_one(in_file: Path, out_file: Path, split_mode: str, mirror: bool) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     info = parse_tgv(in_file)
     mip_idx, offset, size, raw_size = pick_fullres_mip(info)
     raw = decompress_mip(info, offset, size, raw_size)
-    image = decode_tgv_image(info, raw)
-
-    image.save(out_file)
     role = detect_texture_role(in_file, info.fmt)
+    decoded = decode_tgv_image(info, raw)
 
+    image_to_save = decoded
     extras: list[Path] = []
+    track_image: Image.Image | None = None
+    track_out: Path | None = None
+
+    if split_mode == "auto" and role in ("normal", "orm") and np is not None:
+        detect_img = decoded.convert("RGB")
+        main_box, track_box = detect_normal_main_track_bboxes(detect_img)
+    else:
+        main_box, track_box = None, None
+
+    if role == "normal" and np is not None:
+        reconstructed, _ = normal_reconstruct_z(decoded.convert("RGB"))
+        image_to_save = reconstructed
+        if main_box is not None:
+            image_to_save = reconstructed.crop(main_box)
+        if track_box is not None:
+            track_image = reconstructed.crop(track_box)
+            track_out = track_output_path(out_file, role)
+
+    elif role == "orm":
+        if main_box is not None:
+            image_to_save = decoded.crop(main_box)
+        if track_box is not None:
+            track_image = decoded.crop(track_box)
+            track_out = track_output_path(out_file, role)
+
+    image_to_save = maybe_mirror(image_to_save, mirror)
+    image_to_save.save(out_file)
+
+    if track_image is not None and track_out is not None:
+        track_image = maybe_mirror(track_image, mirror)
+        track_image.save(track_out)
+        extras.append(track_out)
+        if split_mode == "auto" and role == "orm":
+            extras.extend(save_auto_channels(track_image, role, track_out))
+
+
     if split_mode == "auto":
-        extras = save_auto_channels(image, role, out_file)
+        extras.extend(save_auto_channels(image_to_save, role, out_file))
     elif split_mode == "all":
-        extras = save_all_channels(image, out_file)
+        extras.extend(save_all_channels(image_to_save, out_file))
 
     print(
         f"[OK] {in_file.name} -> {out_file.name} | "
@@ -416,9 +620,11 @@ def convert_one(in_file: Path, out_file: Path, split_mode: str) -> None:
         print(f"     + {extra.name}")
 
 
-def convert_path(input_path: Path, output_arg: str | None, recursive: bool, split_mode: str) -> None:
+def convert_path(input_path: Path, output_arg: str | None, recursive: bool, split_mode: str, mirror: bool) -> None:
     if input_path.is_file():
-        convert_one(input_path, resolve_output_file(input_path, output_arg), split_mode)
+        unit_name = find_unit_name_in_folder(input_path.parent)
+        stem = canonical_stem_for_file(input_path, unit_name)
+        convert_one(input_path, resolve_output_file(input_path, output_arg, stem_override=stem), split_mode, mirror)
         return
 
     if not input_path.is_dir():
@@ -432,10 +638,17 @@ def convert_path(input_path: Path, output_arg: str | None, recursive: bool, spli
         print(f"No .tgv files found in {input_path}")
         return
 
+    unit_cache: dict[Path, str | None] = {}
+
     for file_path in files:
         rel = file_path.relative_to(input_path)
-        out_file = (out_dir / rel).with_suffix(".png")
-        convert_one(file_path, out_file, split_mode)
+        parent = file_path.parent
+        if parent not in unit_cache:
+            unit_cache[parent] = find_unit_name_in_folder(parent)
+
+        stem = canonical_stem_for_file(file_path, unit_cache[parent])
+        out_file = (out_dir / rel.parent / f"{stem}.png")
+        convert_one(file_path, out_file, split_mode, mirror)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -455,6 +668,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="If input is a folder, search .tgv files recursively",
     )
+    parser.add_argument(
+        "--mirror",
+        action="store_true",
+        help="Mirror textures horizontally before saving",
+    )
+    parser.add_argument(
+        "--ask-mirror",
+        action="store_true",
+        help="Ask interactively whether to mirror textures",
+    )
     return parser
 
 
@@ -462,8 +685,13 @@ def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    mirror = args.mirror
+    if args.ask_mirror:
+        answer = input("Mirror textures horizontally? [y/N]: ").strip().lower()
+        mirror = answer in ("y", "yes", "1", "true")
+
     try:
-        convert_path(Path(args.input), args.output, args.recursive, args.split)
+        convert_path(Path(args.input), args.output, args.recursive, args.split, mirror)
     except Exception as exc:  # keep CLI output user-friendly
         print(f"[ERROR] {exc}")
         return 1
