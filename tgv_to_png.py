@@ -33,6 +33,13 @@ class TGVInfo:
     sizes: list[int]
 
 
+@dataclass(frozen=True)
+class LayoutInfo:
+    size: tuple[int, int]
+    main_box: tuple[int, int, int, int] | None
+    aux_boxes: list[tuple[int, int, int, int]]
+
+
 def normalize_format(raw_fmt: bytes) -> str:
     text = raw_fmt.decode("ascii", errors="ignore").upper()
     patterns = (
@@ -337,6 +344,162 @@ def true_ranges(mask_1d: "np.ndarray") -> list[tuple[int, int]]:
     return ranges
 
 
+def smooth_1d(values: "np.ndarray", window: int) -> "np.ndarray":
+    if window <= 1:
+        return values.astype(np.float32, copy=False)
+    kernel = np.ones(window, dtype=np.float32) / float(window)
+    return np.convolve(values.astype(np.float32), kernel, mode="same")
+
+
+def find_main_cut_row(row_counts: "np.ndarray", width: int) -> int | None:
+    height = len(row_counts)
+    if height < 32:
+        return None
+
+    smooth = smooth_1d(row_counts, max(5, height // 300))
+    ref_window_end = max(12, height // 3)
+    ref = float(np.percentile(smooth[:ref_window_end], 90))
+    if ref <= 0:
+        return None
+
+    # 1) Prefer a strong one-step drop (common for atlas packing main -> lower parts).
+    start = max(8, height // 6)
+    end = max(start + 2, height - 8)
+    deltas = smooth[1:] - smooth[:-1]
+    if end > start:
+        for idx in range(start, end):
+            drop = float(-deltas[idx])
+            if drop < max(8.0, width * 0.01):
+                continue
+
+            before = float(np.mean(smooth[max(0, idx - 32) : idx + 1]))
+            after = float(np.mean(smooth[idx + 1 : min(height, idx + 33)]))
+            if before <= 0:
+                continue
+            if after <= before * 0.93:
+                return idx + 1
+
+    # 2) Fallback: persistent drop band.
+    drop_threshold = ref * 0.80
+    min_run = max(8, height // 256)
+    min_aux_signal = max(4, width // 40)
+    search_start = max(16, height // 10)
+
+    for y in range(search_start, height - min_run):
+        if np.all(smooth[y : y + min_run] <= drop_threshold):
+            if float(np.max(smooth[y + min_run :])) >= min_aux_signal:
+                return y
+    return None
+
+
+def split_range_by_valley(col_counts: "np.ndarray", x0: int, x1: int) -> list[tuple[int, int]]:
+    width = x1 - x0
+    if width < 128:
+        return [(x0, x1)]
+
+    segment = col_counts[x0:x1].astype(np.float32)
+    if segment.size < 8:
+        return [(x0, x1)]
+
+    smooth = smooth_1d(segment, max(9, width // 40))
+    peak_floor = float(smooth.max()) * 0.35
+    if peak_floor <= 0:
+        return [(x0, x1)]
+
+    margin = max(12, width // 18)
+    best_valley = None
+    best_depth = 0.0
+    for v in range(margin, len(smooth) - margin):
+        if not (smooth[v] <= smooth[v - 1] and smooth[v] <= smooth[v + 1]):
+            continue
+
+        left_peak = float(np.max(smooth[:v]))
+        right_peak = float(np.max(smooth[v + 1 :]))
+        peak_min = min(left_peak, right_peak)
+        if peak_min < peak_floor:
+            continue
+
+        depth = peak_min - float(smooth[v])
+        if depth <= peak_min * 0.14:
+            continue
+
+        if depth > best_depth:
+            best_depth = depth
+            best_valley = (v, peak_min, float(smooth[v]))
+
+    if best_valley is None:
+        return [(x0, x1)]
+
+    valley_rel, peak_min, valley_value = best_valley
+    if valley_value > peak_min * 0.86:
+        return [(x0, x1)]
+
+    cut = x0 + valley_rel
+    if cut - x0 < 16 or x1 - cut < 16:
+        return [(x0, x1)]
+    return [(x0, cut), (cut, x1)]
+
+
+def split_range_by_color_jump(
+    band_rgb: "np.ndarray",
+    band_mask: "np.ndarray",
+    x0: int,
+    x1: int,
+) -> list[tuple[int, int]]:
+    width = x1 - x0
+    if width < 96:
+        return [(x0, x1)]
+
+    region_rgb = band_rgb[:, x0:x1, :].astype(np.float32)
+    region_mask = band_mask[:, x0:x1]
+    if not region_mask.any():
+        return [(x0, x1)]
+
+    counts = region_mask.sum(axis=0).astype(np.float32)
+    sums = (region_rgb * region_mask[:, :, None].astype(np.float32)).sum(axis=0)
+    means = np.zeros_like(sums, dtype=np.float32)
+    valid = counts > 0
+    means[valid] = sums[valid] / counts[valid, None]
+
+    # Forward-fill empty columns to avoid artificial jumps.
+    for i in range(1, width):
+        if not valid[i]:
+            means[i] = means[i - 1]
+    for i in range(width - 2, -1, -1):
+        if not valid[i]:
+            means[i] = means[i + 1]
+
+    diffs = np.linalg.norm(means[1:] - means[:-1], axis=1)
+    if diffs.size == 0:
+        return [(x0, x1)]
+
+    diffs = smooth_1d(diffs, max(5, width // 200))
+    lo = max(8, width // 8)
+    hi = max(lo + 1, width - lo)
+    search = diffs[lo:hi]
+    if search.size == 0:
+        return [(x0, x1)]
+
+    cut_rel = int(np.argmax(search)) + lo + 1
+    jump = float(diffs[cut_rel - 1])
+    median_jump = float(np.median(diffs))
+    if jump < max(2.5, median_jump * 2.2):
+        return [(x0, x1)]
+
+    left_mass = float(counts[:cut_rel].sum())
+    right_mass = float(counts[cut_rel:].sum())
+    total_mass = left_mass + right_mass
+    if total_mass <= 0:
+        return [(x0, x1)]
+    if min(left_mass, right_mass) < total_mass * 0.10:
+        return [(x0, x1)]
+
+    cut = x0 + cut_rel
+    if cut - x0 < 16 or x1 - cut < 16:
+        return [(x0, x1)]
+    return [(x0, cut), (cut, x1)]
+
+
 def align_bbox_to_4px(bbox: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
     x0, y0, x1, y1 = bbox
     x0 = max(0, (x0 // 4) * 4)
@@ -368,17 +531,30 @@ def bbox_from_row_range(mask: "np.ndarray", y0: int, y1: int) -> tuple[int, int,
     return int(x0), int(y0), int(x1), int(y1)
 
 
-def detect_normal_main_track_bboxes(image: Image.Image) -> tuple[tuple[int, int, int, int] | None, tuple[int, int, int, int] | None]:
+def detect_main_and_aux_bboxes(
+    image: Image.Image,
+) -> tuple[tuple[int, int, int, int] | None, list[tuple[int, int, int, int]]]:
     if np is None:
-        return None, None
+        return None, []
 
     arr = np.asarray(image.convert("RGB"), dtype=np.uint8)
     if arr.size == 0:
-        return None, None
+        return None, []
 
     height, width, _ = arr.shape
-    sample = arr[::4, ::4].reshape(-1, 3)
-    colors, counts = np.unique(sample, axis=0, return_counts=True)
+
+    # In WARNO atlas-like textures, background padding is usually at corners.
+    corner_sample = np.array(
+        [
+            arr[0, 0],
+            arr[0, width - 1],
+            arr[height - 1, 0],
+            arr[height - 1, width - 1],
+            arr[max(0, height - 2), max(0, width - 2)],
+        ],
+        dtype=np.uint8,
+    )
+    colors, counts = np.unique(corner_sample, axis=0, return_counts=True)
     bg = colors[counts.argmax()]
 
     diff = np.abs(arr.astype(np.int16) - bg.astype(np.int16)).max(axis=2)
@@ -388,50 +564,170 @@ def detect_normal_main_track_bboxes(image: Image.Image) -> tuple[tuple[int, int,
     max_row = int(row_counts.max())
     min_row_pixels = max(8, width // 10)
     if max_row < min_row_pixels:
-        return None, None
+        return None, []
 
-    high_threshold = max(min_row_pixels, int(max_row * 0.75))
-    main_ranges = true_ranges(row_counts >= high_threshold)
-    if not main_ranges:
-        return None, None
+    main_cut = find_main_cut_row(row_counts, width)
+    if main_cut is not None and main_cut > 0:
+        row_active = np.where(row_counts > max(1, width // 200))[0]
+        if row_active.size == 0:
+            return None, []
+        main_y0 = int(row_active[0])
+        main_y1 = int(main_cut)
+    else:
+        high_threshold = max(min_row_pixels, int(max_row * 0.75))
+        main_ranges = true_ranges(row_counts >= high_threshold)
+        if not main_ranges:
+            return None, []
+        main_y0, main_y1 = max(main_ranges, key=lambda r: r[1] - r[0])
 
-    main_y0, main_y1 = max(main_ranges, key=lambda r: r[1] - r[0])
     main_box = bbox_from_row_range(fg, main_y0, main_y1)
     if main_box is None:
-        return None, None
+        return None, []
     main_box = align_bbox_to_4px(main_box, width, height)
 
-    track_box = None
+    aux_boxes: list[tuple[int, int, int, int]] = []
     if main_y1 < height:
-        track_rows = np.zeros(height, dtype=bool)
-        track_rows[main_y1:] = row_counts[main_y1:] >= min_row_pixels
-        track_ranges = true_ranges(track_rows)
-        if track_ranges:
-            ty0, ty1 = max(track_ranges, key=lambda r: r[1] - r[0])
-            candidate = bbox_from_row_range(fg, ty0, ty1)
-            if candidate is not None:
-                candidate = align_bbox_to_4px(candidate, width, height)
-                area = (candidate[2] - candidate[0]) * (candidate[3] - candidate[1])
-                if area >= (width * height) // 200:
-                    track_box = candidate
+        lower = fg[main_y1:]
+        lower_row_counts = lower.sum(axis=1)
+        min_aux_row_pixels = max(4, width // 40)
+        y_ranges = true_ranges(lower_row_counts >= min_aux_row_pixels)
 
-    return main_box, track_box
+        for y0_rel, y1_rel in y_ranges:
+            band = lower[y0_rel:y1_rel]
+            if not band.any():
+                continue
+
+            band_rgb = arr[main_y1 + y0_rel : main_y1 + y1_rel]
+            col_counts = band.sum(axis=0)
+            peak = int(col_counts.max())
+            if peak <= 0:
+                continue
+
+            col_threshold = max(2, int(peak * 0.18))
+            x_ranges = true_ranges(col_counts >= col_threshold)
+
+            if len(x_ranges) <= 1:
+                strong_threshold = max(2, int(peak * 0.40))
+                strong_ranges = true_ranges(col_counts >= strong_threshold)
+                if len(strong_ranges) >= 2:
+                    x_ranges = strong_ranges
+
+            if len(x_ranges) == 1:
+                x_ranges = split_range_by_valley(col_counts, x_ranges[0][0], x_ranges[0][1])
+            if len(x_ranges) == 1:
+                x_ranges = split_range_by_color_jump(band_rgb, band, x_ranges[0][0], x_ranges[0][1])
+
+            for x0, x1 in x_ranges:
+                region = band[:, x0:x1]
+                if not region.any():
+                    continue
+
+                rows_any = np.where(region.any(axis=1))[0]
+                cols_any = np.where(region.any(axis=0))[0]
+                if rows_any.size == 0 or cols_any.size == 0:
+                    continue
+
+                bx0 = int(x0 + cols_any[0])
+                bx1 = int(x0 + cols_any[-1] + 1)
+                by0 = int(main_y1 + y0_rel + rows_any[0])
+                by1 = int(main_y1 + y0_rel + rows_any[-1] + 1)
+
+                box = align_bbox_to_4px((bx0, by0, bx1, by1), width, height)
+                area = (box[2] - box[0]) * (box[3] - box[1])
+                if area >= (width * height) // 500:
+                    aux_boxes.append(box)
+
+    # Keep unique boxes and sort by area (largest first).
+    unique_boxes = list(dict.fromkeys(aux_boxes))
+    unique_boxes.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
+    return main_box, unique_boxes
 
 
-def track_output_path(out_main: Path, role: str) -> Path:
+def part_output_path(out_main: Path, role: str, part_kind: str) -> Path:
     role_low = role.lower()
     base, tag = split_base_and_tag(out_main.stem)
-    if role_low == "normal" and tag == "NM":
-        return out_main.with_name(f"{base}_TRK_NM.png")
-    if role_low == "orm" and tag == "ORM":
-        return out_main.with_name(f"{base}_TRK_ORM.png")
-    return out_main.with_name(f"{out_main.stem}_track_{role_low}.png")
+    if tag:
+        return out_main.with_name(f"{base}_{part_kind}_{tag}.png")
+    return out_main.with_name(f"{out_main.stem}_{part_kind.lower()}_{role_low}.png")
+
+
+def assign_part_kinds(aux_boxes: list[tuple[int, int, int, int]]) -> list[str]:
+    if not aux_boxes:
+        return []
+
+    centers = [((b[0] + b[2]) * 0.5, i) for i, b in enumerate(aux_boxes)]
+    track_idx = max(centers, key=lambda t: t[0])[1]  # right-most block is usually tracks
+
+    kinds = ["" for _ in aux_boxes]
+    kinds[track_idx] = "TRK"
+
+    remaining = [i for i in range(len(aux_boxes)) if i != track_idx]
+    remaining.sort(key=lambda i: (aux_boxes[i][0] + aux_boxes[i][2]) * 0.5)
+    for pos, idx in enumerate(remaining):
+        if pos == 0:
+            kinds[idx] = "MG"
+        else:
+            kinds[idx] = f"PART{pos + 2}"
+    return kinds
 
 
 def maybe_mirror(image: Image.Image, mirror: bool) -> Image.Image:
     if mirror:
         return ImageOps.mirror(image)
     return image
+
+
+def decode_tgv_for_layout(path: Path) -> tuple[Image.Image, str]:
+    info = parse_tgv(path)
+    mip_idx, offset, size, raw_size = pick_fullres_mip(info)
+    raw = decompress_mip(info, offset, size, raw_size)
+    role = detect_texture_role(path, info.fmt)
+    decoded = decode_tgv_image(info, raw)
+    if role == "normal" and np is not None:
+        reconstructed, _ = normal_reconstruct_z(decoded.convert("RGB"))
+        return reconstructed, role
+    return decoded, role
+
+
+def build_layout_for_group(files: list[Path]) -> LayoutInfo | None:
+    if np is None:
+        return None
+
+    # Prefer maps that usually contain clearer packed blocks.
+    priority = {"orm": 0, "normal": 1, "generic": 2}
+    best: tuple[int, int, LayoutInfo] | None = None  # (aux_count, priority_neg, layout)
+
+    for path in files:
+        try:
+            image, role = decode_tgv_for_layout(path)
+        except Exception:
+            continue
+
+        main_box, aux_boxes = detect_main_and_aux_bboxes(image.convert("RGB"))
+        if main_box is None and not aux_boxes:
+            continue
+
+        layout = LayoutInfo(size=image.size, main_box=main_box, aux_boxes=aux_boxes)
+        score = (
+            len(aux_boxes),
+            -priority.get(role, 9),
+        )
+        if best is None or score > (best[0], best[1]):
+            best = (score[0], score[1], layout)
+
+    if best is None:
+        return None
+    return best[2]
+
+
+def scale_box(box: tuple[int, int, int, int], src_size: tuple[int, int], dst_size: tuple[int, int]) -> tuple[int, int, int, int]:
+    sx = dst_size[0] / float(src_size[0])
+    sy = dst_size[1] / float(src_size[1])
+    x0 = int(round(box[0] * sx))
+    y0 = int(round(box[1] * sy))
+    x1 = int(round(box[2] * sx))
+    y1 = int(round(box[3] * sy))
+    return align_bbox_to_4px((x0, y0, x1, y1), dst_size[0], dst_size[1])
 
 
 def normal_reconstruct_z(rgb: Image.Image) -> tuple[Image.Image, Image.Image]:
@@ -560,7 +856,13 @@ def resolve_output_file(in_file: Path, output_arg: str | None, stem_override: st
     return out / f"{stem}.png"
 
 
-def convert_one(in_file: Path, out_file: Path, split_mode: str, mirror: bool) -> None:
+def convert_one(
+    in_file: Path,
+    out_file: Path,
+    split_mode: str,
+    mirror: bool,
+    shared_layout: LayoutInfo | None = None,
+) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     info = parse_tgv(in_file)
@@ -569,43 +871,56 @@ def convert_one(in_file: Path, out_file: Path, split_mode: str, mirror: bool) ->
     role = detect_texture_role(in_file, info.fmt)
     decoded = decode_tgv_image(info, raw)
 
+    base_tag = split_base_and_tag(out_file.stem)[1]
     image_to_save = decoded
     extras: list[Path] = []
-    track_image: Image.Image | None = None
-    track_out: Path | None = None
-
-    if split_mode == "auto" and role in ("normal", "orm") and np is not None:
-        detect_img = decoded.convert("RGB")
-        main_box, track_box = detect_normal_main_track_bboxes(detect_img)
-    else:
-        main_box, track_box = None, None
+    part_images: list[tuple[Image.Image, Path]] = []
 
     if role == "normal" and np is not None:
         reconstructed, _ = normal_reconstruct_z(decoded.convert("RGB"))
+        source_for_split = reconstructed
         image_to_save = reconstructed
-        if main_box is not None:
-            image_to_save = reconstructed.crop(main_box)
-        if track_box is not None:
-            track_image = reconstructed.crop(track_box)
-            track_out = track_output_path(out_file, role)
+    else:
+        source_for_split = decoded
 
-    elif role == "orm":
+    split_candidates = {"D", "NM", "ORM"}
+    is_diffuse_like = role == "generic" and "diffuse" in in_file.stem.lower()
+    should_split_parts = base_tag in split_candidates or role in ("normal", "orm") or is_diffuse_like
+    if split_mode == "auto" and np is not None and should_split_parts:
+        if shared_layout is not None:
+            if shared_layout.size == source_for_split.size:
+                main_box = shared_layout.main_box
+                aux_boxes = list(shared_layout.aux_boxes)
+            else:
+                main_box = (
+                    scale_box(shared_layout.main_box, shared_layout.size, source_for_split.size)
+                    if shared_layout.main_box is not None
+                    else None
+                )
+                aux_boxes = [scale_box(box, shared_layout.size, source_for_split.size) for box in shared_layout.aux_boxes]
+        else:
+            main_box, aux_boxes = detect_main_and_aux_bboxes(source_for_split.convert("RGB"))
+
         if main_box is not None:
-            image_to_save = decoded.crop(main_box)
-        if track_box is not None:
-            track_image = decoded.crop(track_box)
-            track_out = track_output_path(out_file, role)
+            image_to_save = source_for_split.crop(main_box)
+
+        part_kinds = assign_part_kinds(aux_boxes)
+        for idx, box in enumerate(aux_boxes):
+            kind = part_kinds[idx] if idx < len(part_kinds) and part_kinds[idx] else f"PART{idx + 1}"
+            part_out = part_output_path(out_file, role, kind)
+            part_images.append((source_for_split.crop(box), part_out))
 
     image_to_save = maybe_mirror(image_to_save, mirror)
     image_to_save.save(out_file)
 
-    if track_image is not None and track_out is not None:
-        track_image = maybe_mirror(track_image, mirror)
-        track_image.save(track_out)
-        extras.append(track_out)
-        if split_mode == "auto" and role == "orm":
-            extras.extend(save_auto_channels(track_image, role, track_out))
-
+    for part_image, part_out in part_images:
+        part_image = maybe_mirror(part_image, mirror)
+        part_image.save(part_out)
+        extras.append(part_out)
+        if split_mode == "auto":
+            extras.extend(save_auto_channels(part_image, role, part_out))
+        elif split_mode == "all":
+            extras.extend(save_all_channels(part_image, part_out))
 
     if split_mode == "auto":
         extras.extend(save_auto_channels(image_to_save, role, out_file))
@@ -624,7 +939,14 @@ def convert_path(input_path: Path, output_arg: str | None, recursive: bool, spli
     if input_path.is_file():
         unit_name = find_unit_name_in_folder(input_path.parent)
         stem = canonical_stem_for_file(input_path, unit_name)
-        convert_one(input_path, resolve_output_file(input_path, output_arg, stem_override=stem), split_mode, mirror)
+        shared_layout = build_layout_for_group([input_path]) if split_mode == "auto" else None
+        convert_one(
+            input_path,
+            resolve_output_file(input_path, output_arg, stem_override=stem),
+            split_mode,
+            mirror,
+            shared_layout=shared_layout,
+        )
         return
 
     if not input_path.is_dir():
@@ -639,6 +961,14 @@ def convert_path(input_path: Path, output_arg: str | None, recursive: bool, spli
         return
 
     unit_cache: dict[Path, str | None] = {}
+    files_by_parent: dict[Path, list[Path]] = {}
+    for file_path in files:
+        files_by_parent.setdefault(file_path.parent, []).append(file_path)
+
+    layout_cache: dict[Path, LayoutInfo | None] = {}
+    if split_mode == "auto":
+        for parent, parent_files in files_by_parent.items():
+            layout_cache[parent] = build_layout_for_group(parent_files)
 
     for file_path in files:
         rel = file_path.relative_to(input_path)
@@ -648,7 +978,7 @@ def convert_path(input_path: Path, output_arg: str | None, recursive: bool, spli
 
         stem = canonical_stem_for_file(file_path, unit_cache[parent])
         out_file = (out_dir / rel.parent / f"{stem}.png")
-        convert_one(file_path, out_file, split_mode, mirror)
+        convert_one(file_path, out_file, split_mode, mirror, shared_layout=layout_cache.get(parent))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
