@@ -1,4 +1,4 @@
-WARNO TGV CONVERTER TO PNG
+WARNO TGV CONVERTER TO PNG - ALPHA VERSION
 -
 U need Python and zstandard
 >Install first Python https://www.python.org/downloads/
