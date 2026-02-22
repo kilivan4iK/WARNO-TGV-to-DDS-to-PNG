@@ -351,6 +351,11 @@ def split_base_and_tag(stem: str) -> tuple[str, str | None]:
     return stem, None
 
 
+def is_track_like_source_name(path: Path) -> bool:
+    low = path.stem.lower()
+    return "_trk" in low or "track" in low or "chenille" in low
+
+
 def true_ranges(mask_1d: "np.ndarray") -> list[tuple[int, int]]:
     ranges: list[tuple[int, int]] = []
     start = None
@@ -595,6 +600,7 @@ def bbox_from_row_range(mask: "np.ndarray", y0: int, y1: int) -> tuple[int, int,
 
 def detect_main_and_aux_bboxes(
     image: Image.Image,
+    allow_subsplit: bool = True,
 ) -> tuple[tuple[int, int, int, int] | None, list[tuple[int, int, int, int]]]:
     if np is None:
         return None, []
@@ -674,9 +680,9 @@ def detect_main_and_aux_bboxes(
                 if len(strong_ranges) >= 2:
                     x_ranges = strong_ranges
 
-            if len(x_ranges) == 1:
+            if allow_subsplit and len(x_ranges) == 1:
                 x_ranges = split_range_by_valley(col_counts, x_ranges[0][0], x_ranges[0][1])
-            if len(x_ranges) == 1:
+            if allow_subsplit and len(x_ranges) == 1:
                 x_ranges = split_range_by_color_jump(band_rgb, band, x_ranges[0][0], x_ranges[0][1])
 
             for x0, x1 in x_ranges:
@@ -766,13 +772,17 @@ def decode_tgv_for_layout(path: Path) -> tuple[Image.Image, str]:
     return decoded, role
 
 
-def build_layout_for_group(files: list[Path]) -> LayoutInfo | None:
+def build_layout_for_group(
+    files: list[Path],
+    atlas_category: str | None = None,
+    aggressive_split: bool = False,
+) -> LayoutInfo | None:
     if np is None:
         return None
 
     # Prefer maps that usually contain clearer packed blocks.
     priority = {"orm": 0, "normal": 1, "generic": 2}
-    best: tuple[int, int, LayoutInfo] | None = None  # (aux_count, priority_neg, layout)
+    best: tuple[int, int, int, LayoutInfo] | None = None  # (aux_count, aux_area, priority_neg, layout)
 
     for path in files:
         try:
@@ -780,21 +790,39 @@ def build_layout_for_group(files: list[Path]) -> LayoutInfo | None:
         except Exception:
             continue
 
-        main_box, aux_boxes = detect_main_and_aux_bboxes(image.convert("RGB"))
+        if is_track_like_source_name(path) and not aggressive_split:
+            continue
+
+        main_box, aux_boxes = detect_main_and_aux_bboxes(
+            image.convert("RGB"),
+            allow_subsplit=bool(aggressive_split),
+        )
+        main_box, aux_boxes = refine_layout_to_content(image.convert("RGB"), main_box, aux_boxes)
+        aux_boxes = filter_aux_boxes_for_parts(aux_boxes, image.size)
+        if not should_split_layout(
+            image.size,
+            main_box,
+            aux_boxes,
+            atlas_category,
+            aggressive=bool(aggressive_split),
+        ):
+            continue
         if main_box is None and not aux_boxes:
             continue
 
         layout = LayoutInfo(size=image.size, main_box=main_box, aux_boxes=aux_boxes)
+        total_aux_area = sum(box_area(b) for b in aux_boxes)
         score = (
             len(aux_boxes),
+            total_aux_area,
             -priority.get(role, 9),
         )
-        if best is None or score > (best[0], best[1]):
-            best = (score[0], score[1], layout)
+        if best is None or score > (best[0], best[1], best[2]):
+            best = (score[0], score[1], score[2], layout)
 
     if best is None:
         return None
-    return best[2]
+    return best[3]
 
 
 def scale_box(box: tuple[int, int, int, int], src_size: tuple[int, int], dst_size: tuple[int, int]) -> tuple[int, int, int, int]:
@@ -940,6 +968,7 @@ def should_split_layout(
     main_box: tuple[int, int, int, int] | None,
     aux_boxes: list[tuple[int, int, int, int]],
     atlas_category: str | None,
+    aggressive: bool = False,
 ) -> bool:
     if main_box is None or not aux_boxes:
         return False
@@ -948,29 +977,51 @@ def should_split_layout(
     total = float(width * height)
     main_ratio = box_area(main_box) / total
 
-    if main_ratio < 0.20 or main_ratio > 0.90:
+    if aggressive:
+        main_min = 0.20
+        main_max = 0.90
+        sig_min = 0.012
+        aux_min = 0.015
+        dense_aux_limit = 4
+        dense_aux_total_min = 0.08
+    else:
+        # Safer defaults for importer workflow: split only on strong signal.
+        main_min = 0.28
+        main_max = 0.82
+        sig_min = 0.018
+        aux_min = 0.03
+        dense_aux_limit = 3
+        dense_aux_total_min = 0.10
+
+    if main_ratio < main_min or main_ratio > main_max:
         return False
 
     aux_areas = [box_area(b) / total for b in aux_boxes]
-    significant = [a for a in aux_areas if a >= 0.012]
+    significant = [a for a in aux_areas if a >= sig_min]
     if not significant:
         return False
 
     total_aux = float(sum(aux_areas))
-    if total_aux < 0.015:
+    if total_aux < aux_min:
         return False
 
     # Avoid noisy over-splitting on dense atlases with many tiny pieces.
-    if len(aux_boxes) > 4 and total_aux < 0.08:
+    if len(aux_boxes) > dense_aux_limit and total_aux < dense_aux_total_min:
         return False
 
     if atlas_category == "unit":
-        return True
+        if aggressive:
+            return True
+        return len(significant) >= 1 and total_aux >= 0.03
     if atlas_category == "decor":
-        return total_aux >= 0.025 and len(significant) >= 1
+        if aggressive:
+            return total_aux >= 0.025 and len(significant) >= 1
+        return total_aux >= 0.05 and len(significant) >= 2
 
     # Unknown atlas type: require stronger signal to avoid false positives.
-    return (len(significant) >= 2 and total_aux >= 0.03) or total_aux >= 0.05
+    if aggressive:
+        return (len(significant) >= 2 and total_aux >= 0.03) or total_aux >= 0.05
+    return (len(significant) >= 2 and total_aux >= 0.05) or total_aux >= 0.08
 
 
 def normal_reconstruct_z(rgb: Image.Image) -> tuple[Image.Image, Image.Image]:
@@ -1125,6 +1176,7 @@ def convert_one(
     out_file: Path,
     split_mode: str,
     mirror: bool,
+    aggressive_split: bool = False,
     shared_layout: LayoutInfo | None = None,
     atlas_category: str | None = None,
 ) -> None:
@@ -1151,26 +1203,52 @@ def convert_one(
     split_candidates = {"D", "NM", "ORM"}
     is_diffuse_like = role == "generic" and "diffuse" in in_file.stem.lower()
     should_split_parts = base_tag in split_candidates or role in ("normal", "orm") or is_diffuse_like
-    if split_mode == "auto" and np is not None and should_split_parts:
+    skip_spatial_split = is_track_like_source_name(in_file) and not bool(aggressive_split)
+    if split_mode == "auto" and np is not None and should_split_parts and not skip_spatial_split:
+        shared_mode = ""  # "", "full", "aux_only"
         if shared_layout is not None:
-            if shared_layout.size == source_for_split.size:
-                main_box = shared_layout.main_box
-                aux_boxes = list(shared_layout.aux_boxes)
-            else:
-                main_box = (
-                    scale_box(shared_layout.main_box, shared_layout.size, source_for_split.size)
-                    if shared_layout.main_box is not None
-                    else None
-                )
+            src_w, src_h = shared_layout.size
+            dst_w, dst_h = source_for_split.size
+            sx = (dst_w / float(src_w)) if src_w > 0 else 1.0
+            sy = (dst_h / float(src_h)) if src_h > 0 else 1.0
+            # Share layout only when scale is close to uniform.
+            if abs(sx - sy) <= 0.06:
+                if shared_layout.size == source_for_split.size:
+                    main_box = shared_layout.main_box
+                    aux_boxes = list(shared_layout.aux_boxes)
+                else:
+                    main_box = (
+                        scale_box(shared_layout.main_box, shared_layout.size, source_for_split.size)
+                        if shared_layout.main_box is not None
+                        else None
+                    )
+                    aux_boxes = [scale_box(box, shared_layout.size, source_for_split.size) for box in shared_layout.aux_boxes]
+                aux_boxes = filter_aux_boxes_for_parts(aux_boxes, source_for_split.size)
+                shared_mode = "full"
+            elif is_diffuse_like and shared_layout.aux_boxes:
+                # Diffuse maps are often 2048x2048 while NM/ORM are 2048x4096.
+                # Reuse only aux boxes from shared layout, but keep diffuse main intact.
+                main_box = None
                 aux_boxes = [scale_box(box, shared_layout.size, source_for_split.size) for box in shared_layout.aux_boxes]
-        else:
-            main_box, aux_boxes = detect_main_and_aux_bboxes(source_for_split.convert("RGB"))
+                aux_boxes = filter_aux_boxes_for_parts(aux_boxes, source_for_split.size)
+                shared_mode = "aux_only"
 
-        main_box, aux_boxes = refine_layout_to_content(source_for_split.convert("RGB"), main_box, aux_boxes)
-        aux_boxes = filter_aux_boxes_for_parts(aux_boxes, source_for_split.size)
-        if not should_split_layout(source_for_split.size, main_box, aux_boxes, atlas_category):
-            main_box = None
-            aux_boxes = []
+        if not shared_mode:
+            main_box, aux_boxes = detect_main_and_aux_bboxes(
+                source_for_split.convert("RGB"),
+                allow_subsplit=bool(aggressive_split),
+            )
+            main_box, aux_boxes = refine_layout_to_content(source_for_split.convert("RGB"), main_box, aux_boxes)
+            aux_boxes = filter_aux_boxes_for_parts(aux_boxes, source_for_split.size)
+            if not should_split_layout(
+                source_for_split.size,
+                main_box,
+                aux_boxes,
+                atlas_category,
+                aggressive=bool(aggressive_split),
+            ):
+                main_box = None
+                aux_boxes = []
 
         if main_box is not None:
             image_to_save = source_for_split.crop(main_box)
@@ -1216,18 +1294,28 @@ def convert_path(
     split_mode: str,
     mirror: bool,
     auto_naming: bool,
+    aggressive_split: bool = False,
 ) -> None:
     if input_path.is_file():
         parent = input_path.parent
         unit_name = find_unit_name_in_folder(parent) if auto_naming else None
         atlas_category = detect_atlas_category_in_folder(parent)
         stem = canonical_stem_for_file(input_path, unit_name)
-        shared_layout = build_layout_for_group([input_path]) if split_mode == "auto" else None
+        shared_layout = (
+            build_layout_for_group(
+                [input_path],
+                atlas_category=atlas_category,
+                aggressive_split=bool(aggressive_split),
+            )
+            if split_mode == "auto"
+            else None
+        )
         convert_one(
             input_path,
             resolve_output_file(input_path, output_arg, stem_override=stem),
             split_mode,
             mirror,
+            aggressive_split=aggressive_split,
             shared_layout=shared_layout,
             atlas_category=atlas_category,
         )
@@ -1253,7 +1341,13 @@ def convert_path(
     layout_cache: dict[Path, LayoutInfo | None] = {}
     if split_mode == "auto":
         for parent, parent_files in files_by_parent.items():
-            layout_cache[parent] = build_layout_for_group(parent_files)
+            if parent not in atlas_category_cache:
+                atlas_category_cache[parent] = detect_atlas_category_in_folder(parent)
+            layout_cache[parent] = build_layout_for_group(
+                parent_files,
+                atlas_category=atlas_category_cache.get(parent),
+                aggressive_split=bool(aggressive_split),
+            )
 
     for file_path in files:
         rel = file_path.relative_to(input_path)
@@ -1270,6 +1364,7 @@ def convert_path(
             out_file,
             split_mode,
             mirror,
+            aggressive_split=aggressive_split,
             shared_layout=layout_cache.get(parent),
             atlas_category=atlas_category_cache.get(parent),
         )
@@ -1310,6 +1405,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="Keep original source file names",
     )
+    parser.add_argument(
+        "--aggressive-split",
+        action="store_true",
+        help="Use more aggressive auto split heuristics",
+    )
     return parser
 
 
@@ -1325,6 +1425,7 @@ def main() -> int:
             args.split,
             args.mirror,
             args.auto_naming,
+            args.aggressive_split,
         )
     except Exception as exc:  # keep CLI output user-friendly
         print(f"[ERROR] {exc}")
